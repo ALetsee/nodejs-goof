@@ -1,0 +1,199 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DAST_TARGET: http://3.95.181.72:3001/
+  DD_URL: https://demo.defectdojo.org
+  DD_PRODUCT_NAME: ARGZ
+  DD_PRODUCT_TYPE: Research and Development
+
+jobs:
+  secrets-scan:
+    name: 1) Secretos (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks version
+
+      - name: Ejecutar Gitleaks
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            RANGE="-1"
+          fi
+          echo "Rango analizado: $RANGE"
+          gitleaks detect --source . --log-opts="$RANGE" --redact --verbose \
+            --report-format json --report-path gitleaks-report.json
+
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+
+  sbom-syft:
+    name: 2a) SBOM (Syft)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+      - name: Generar SBOM
+        run: syft scan dir:. -o cyclonedx-json=sbom-cyclonedx.json -o spdx-json=sbom-spdx.json
+      - name: Guardar SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syft-sbom
+          path: sbom-*.json
+
+  sca-grype:
+    name: 2b) SCA (Grype)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+      - name: Escanear dependencias
+        run: |
+          grype dir:. -o json > grype-results.json
+          echo "Vulnerabilidades encontradas: $(jq '.matches | length' grype-results.json)"
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-results
+          path: grype-results.json
+
+  sast-snyk:
+    name: 3) SAST (Snyk Code)
+    needs: [sbom-syft, sca-grype]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Instalar Snyk CLI
+        run: npm install -g snyk
+      - name: Snyk Code test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --sarif-file-output=snyk-code.sarif --json-file-output=snyk-code.json
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code-results
+          path: snyk-code.*
+
+  dast-zap:
+    name: 4) DAST (ZAP baseline)
+    needs: sast-snyk
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZAP Baseline
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ env.DAST_TARGET }}
+          cmd_options: '-x report_xml.xml'
+          allow_issue_writing: false
+          fail_action: false
+          artifact_name: zap-action-report
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: |
+            report_xml.xml
+            report_json.json
+            report_html.html
+            report_md.md
+
+  defectdojo-import:
+    name: 5) Importar a DefectDojo
+    needs: [secrets-scan, sbom-syft, sca-grype, sast-snyk, dast-zap]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar artefactos
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Listar artefactos
+        run: ls -R artifacts
+
+      - name: Subir resultados
+        env:
+          DD_USERNAME: ${{ secrets.DD_USERNAME }}
+          DD_PASSWORD: ${{ secrets.DD_PASSWORD }}
+        run: |
+          BODY=$(jq -n --arg u "$DD_USERNAME" --arg p "$DD_PASSWORD" '{username:$u,password:$p}')
+          TOKEN=$(curl -sS -X POST "$DD_URL/api/v2/api-token-auth/" \
+            -H "Content-Type: application/json" -d "$BODY" | jq -r '.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::No se pudo autenticar en DefectDojo"; exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+
+          ENGAGEMENT="CI-run-${GITHUB_RUN_NUMBER}"
+
+          import_scan() {
+            local scan_type="$1" file="$2"
+            if [ ! -f "$file" ]; then
+              echo "::warning::No existe $file, se omite ($scan_type)"; return 0
+            fi
+            echo ">> Importando $scan_type desde $file"
+            code=$(curl -sS -o resp.json -w "%{http_code}" -X POST "$DD_URL/api/v2/import-scan/" \
+              -H "Authorization: Token $TOKEN" \
+              -F "scan_type=$scan_type" \
+              -F "file=@$file" \
+              -F "product_name=$DD_PRODUCT_NAME" \
+              -F "product_type_name=$DD_PRODUCT_TYPE" \
+              -F "engagement_name=$ENGAGEMENT" \
+              -F "auto_create_context=true" \
+              -F "active=true" \
+              -F "verified=false" \
+              -F "minimum_severity=Info" \
+              -F "scan_date=$(date +%F)")
+            echo "HTTP $code"; head -c 400 resp.json; echo
+          }
+
+          import_scan "Gitleaks Scan"  artifacts/gitleaks-report/gitleaks-report.json
+          import_scan "CycloneDX Scan" artifacts/syft-sbom/sbom-cyclonedx.json
+          import_scan "Anchore Grype"  artifacts/grype-results/grype-results.json
+          import_scan "SARIF"          artifacts/snyk-code-results/snyk-code.sarif
+          import_scan "ZAP Scan"       artifacts/zap-reports/report_xml.xml
